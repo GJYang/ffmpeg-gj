@@ -2139,7 +2139,7 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt);
  * @see av_write_frame(), AVFormatContext.max_interleave_delta
  */
 int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt);
-
+int av_interleaved_write_frame_buff(AVFormatContext *s, AVPacket *pkt, const unsigned char **ppTSBuff, const unsigned char **pplen);
 /**
  * Write a uncoded frame to an output media file.
  *

@@ -281,6 +281,8 @@ int avio_printf(AVIOContext *s, const char *fmt, ...) av_printf_format(2, 3);
  * without to wait to fill the internal buffer.
  */
 void avio_flush(AVIOContext *s);
+int avio_flush_fake(AVIOContext *s, const unsigned char **buf, const unsigned char **len);
+void flush_buffer_fake(AVIOContext *s);
 
 /**
  * Read size bytes from AVIOContext into buf.

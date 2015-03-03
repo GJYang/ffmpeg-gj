@@ -147,6 +147,21 @@ static void flush_buffer(AVIOContext *s)
     }
     s->buf_ptr = s->buffer;
 }
+// origin code : "static void flush_buffer(AVIOContext *s)"
+void flush_buffer_fake(AVIOContext *s)
+{
+    //if (s->buf_ptr > s->buffer) {
+        //writeout(s, s->buffer, s->buf_ptr - s->buffer);
+        if (s->buf_ptr > s->buffer) {
+            if (s->update_checksum) {
+                s->checksum     = s->update_checksum(s->checksum, s->checksum_ptr,
+                                                     s->buf_ptr - s->checksum_ptr);
+                s->checksum_ptr = s->buffer;
+            }
+        }
+    //}
+    // s->buf_ptr = s->buffer;
+}
 
 void avio_w8(AVIOContext *s, int b)
 {
@@ -194,6 +209,32 @@ void avio_flush(AVIOContext *s)
 {
     flush_buffer(s);
     s->must_flush = 0;
+}
+
+// origin code : "void avio_flush(AVIOContext *s)"
+int avio_flush_fake(AVIOContext *s, const unsigned char **buf, const unsigned char **len)
+{
+/*  flush_buffer()  */
+/*    
+if (s->buf_ptr > s->buffer) {
+        writeout(s, s->buffer, s->buf_ptr - s->buffer);
+        if (s->update_checksum) {
+            s->checksum     = s->update_checksum(s->checksum, s->checksum_ptr,
+                                                 s->buf_ptr - s->checksum_ptr);
+            s->checksum_ptr = s->buffer;
+        }
+    }
+    s->buf_ptr = s->buffer;
+*/
+
+
+    if (s->buf_ptr > s->buffer) {
+        *buf = s->buffer;
+        *len = s->buf_ptr - s->buffer;
+    }
+    s->buf_ptr = s->buffer;
+    s->must_flush = 0;
+    return 0;
 }
 
 int64_t avio_seek(AVIOContext *s, int64_t offset, int whence)

@@ -528,6 +528,8 @@ static int compute_pkt_fields2(AVFormatContext *s, AVStream *st, AVPacket *pkt)
  */
 static int write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    const unsigned char *pTSBuff;
+    const unsigned char *len;
     int ret, did_split;
 
     if (s->output_ts_offset) {
@@ -573,7 +575,73 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
         av_frame_free(&frame);
     } else {
         ret = s->oformat->write_packet(s, pkt);
+        avio_flush_fake(s->pb, &pTSBuff, &len);
     }
+
+    if (s->flush_packets && s->pb && ret >= 0 && s->flags & AVFMT_FLAG_FLUSH_PACKETS)
+        avio_flush(s->pb);
+
+    if (did_split)
+        av_packet_merge_side_data(pkt);
+
+    return ret;
+}
+
+static int write_packet2buff(AVFormatContext *s, AVPacket *pkt, const unsigned char **ppTSBuff, const unsigned char **pplen)
+{
+    int ret, did_split;
+    const unsigned char *pTSBuff;
+    const unsigned char *len;
+
+    if (s->output_ts_offset) {
+        AVStream *st = s->streams[pkt->stream_index];
+        int64_t offset = av_rescale_q(s->output_ts_offset, AV_TIME_BASE_Q, st->time_base);
+
+        if (pkt->dts != AV_NOPTS_VALUE)
+            pkt->dts += offset;
+        if (pkt->pts != AV_NOPTS_VALUE)
+            pkt->pts += offset;
+    }
+
+    if (s->avoid_negative_ts > 0) {
+        AVStream *st = s->streams[pkt->stream_index];
+        int64_t offset = st->mux_ts_offset;
+
+        if ((pkt->dts < 0 || s->avoid_negative_ts == 2) && pkt->dts != AV_NOPTS_VALUE && !s->offset) {
+            s->offset = -pkt->dts;
+            s->offset_timebase = st->time_base;
+        }
+
+        if (s->offset && !offset) {
+            offset = st->mux_ts_offset =
+                av_rescale_q_rnd(s->offset,
+                                 s->offset_timebase,
+                                 st->time_base,
+                                 AV_ROUND_UP);
+        }
+
+        if (pkt->dts != AV_NOPTS_VALUE)
+            pkt->dts += offset;
+        if (pkt->pts != AV_NOPTS_VALUE)
+            pkt->pts += offset;
+
+        av_assert2(pkt->dts == AV_NOPTS_VALUE || pkt->dts >= 0);
+    }
+
+    did_split = av_packet_split_side_data(pkt);
+    if ((pkt->flags & AV_PKT_FLAG_UNCODED_FRAME)) {
+        AVFrame *frame = (AVFrame *)pkt->data;
+        av_assert0(pkt->size == UNCODED_FRAME_PACKET_SIZE);
+        ret = s->oformat->write_uncoded_frame(s, pkt->stream_index, &frame, 0);
+        av_frame_free(&frame);
+    } else {
+        ret = s->oformat->write_packet(s, pkt);
+    }
+
+    avio_flush_fake(s->pb, &pTSBuff, &len);
+    //av_dlog(s, "      muxbf(2) [0x%08x 0x%08x]\n", pTSBuff, len);
+    *ppTSBuff = pTSBuff;
+    *pplen = len;
 
     if (s->flush_packets && s->pb && ret >= 0 && s->flags & AVFMT_FLAG_FLUSH_PACKETS)
         avio_flush(s->pb);
@@ -879,6 +947,7 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
             return ret;
 
         ret = write_packet(s, &opkt);
+        avio_flush(s->pb);
         if (ret >= 0)
             s->streams[opkt.stream_index]->nb_frames++;
 
@@ -893,6 +962,73 @@ fail:
     av_packet_unref(pkt);
     return ret;
 }
+int av_interleaved_write_frame_buff(AVFormatContext *s, AVPacket *pkt, const unsigned char **ppTSBuff, const unsigned char **pplen)
+{
+    const unsigned char *pTSBuff;
+    const unsigned char *len;
+    int ret, flush = 0;
+
+    ret = check_packet(s, pkt);
+    if (ret < 0)
+        goto fail;
+
+    if (pkt) {
+        AVStream *st = s->streams[pkt->stream_index];
+
+        //FIXME/XXX/HACK drop zero sized packets
+        if (st->codec->codec_type == AVMEDIA_TYPE_AUDIO && pkt->size == 0) {
+            ret = 0;
+            goto fail;
+        }
+
+        av_dlog(s, "av_interleaved_write_frame size:%d dts:%s pts:%s\n",
+                pkt->size, av_ts2str(pkt->dts), av_ts2str(pkt->pts));
+        if ((ret = compute_pkt_fields2(s, st, pkt)) < 0 && !(s->oformat->flags & AVFMT_NOTIMESTAMPS))
+            goto fail;
+
+        if (pkt->dts == AV_NOPTS_VALUE && !(s->oformat->flags & AVFMT_NOTIMESTAMPS)) {
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+    } else {
+        av_dlog(s, "av_interleaved_write_frame FLUSH\n");
+        flush = 1;
+    }
+
+    for (;; ) {
+        AVPacket opkt;
+        int ret = interleave_packet(s, &opkt, pkt, flush);
+        if (pkt) {
+            memset(pkt, 0, sizeof(*pkt));
+            av_init_packet(pkt);
+            pkt = NULL;
+        }
+        if (ret <= 0) //FIXME cleanup needed for ret<0 ?
+            return ret;
+
+        //ret = write_packet(s, &opkt);
+        
+        ret = write_packet2buff(s, &opkt, &pTSBuff, &len);
+        flush_buffer_fake(s->pb);
+        avio_flush_fake(s->pb, &pTSBuff, &len);
+        *ppTSBuff = pTSBuff;
+        *pplen = len;
+
+        if (ret >= 0)
+            s->streams[opkt.stream_index]->nb_frames++;
+
+        av_free_packet(&opkt);
+
+        if (ret < 0)
+            return ret;
+        if(s->pb && s->pb->error)
+            return s->pb->error;
+    }
+fail:
+    av_packet_unref(pkt);
+    return ret;
+}
+
 
 int av_write_trailer(AVFormatContext *s)
 {
